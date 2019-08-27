@@ -17,6 +17,8 @@ use wayland_protocols::wlr::unstable::layer_shell::v1::client::{
 use crate::color::Color;
 use crate::buffer::Buffer;
 
+use crate::cmd::Cmd;
+
 use crate::modules::backlight::Backlight;
 use crate::modules::battery::UpowerBattery;
 use crate::modules::calendar::Calendar;
@@ -25,12 +27,9 @@ use crate::modules::launcher::Launcher;
 use crate::modules::module::{Input, Module};
 use crate::modules::sound::PulseAudio;
 
-pub enum Cmd {
-    Exit,
-    Draw,
-    ForceDraw,
-    MouseInput { pos: (u32, u32), input: Input },
-    KeyboardInput { input: Input },
+pub enum OutputMode {
+    Active,
+    All,
 }
 
 struct AppInner {
@@ -41,11 +40,13 @@ struct AppInner {
     outputs: Vec<(u32, wl_output::WlOutput)>,
     shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
     dimensions: (u32, u32),
-    draw_tx: Sender<bool>,
+    draw_tx: Sender<Cmd>,
+    output_mode: OutputMode,
+    visible: bool,
 }
 
 impl AppInner {
-    fn new(tx: Sender<bool>) -> AppInner{
+    fn new(tx: Sender<Cmd>, output_mode: OutputMode) -> AppInner{
         AppInner{
             compositor: None,
             surfaces: Vec::new(),
@@ -55,7 +56,53 @@ impl AppInner {
             shell: None,
             dimensions: (0, 0),
             draw_tx: tx,
+            output_mode: output_mode,
+            visible: true,
         }
+    }
+
+    fn add_shell_surface(
+        compositor: &wl_compositor::WlCompositor,
+        shell: &zwlr_layer_shell_v1::ZwlrLayerShellV1,
+        dimensions: (u32, u32),
+        configured_surfaces: Arc<Mutex<usize>>,
+        tx: Sender<Cmd>,
+        output: Option<&wl_output::WlOutput>
+    ) -> (
+        wl_surface::WlSurface,
+        zwlr_layer_surface_v1::ZwlrLayerSurfaceV1
+    ) {
+        let surface = compositor
+            .create_surface(NewProxy::implement_dummy)
+            .unwrap();
+
+        let shell_surface = shell
+            .get_layer_surface(
+                &surface,
+                output,
+                zwlr_layer_shell_v1::Layer::Overlay,
+                "".to_string(),
+                move |layer| {
+                    layer.implement_closure(
+                        move |evt, layer| match evt {
+                            zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
+                                *(configured_surfaces.lock().unwrap()) += 1;
+                                layer.ack_configure(serial);
+                                tx.send(Cmd::ForceDraw).unwrap();
+                            }
+                            _ => unreachable!(),
+                        },
+                        (),
+                    )
+                },
+            )
+            .unwrap();
+
+        shell_surface.set_keyboard_interactivity(1);
+        shell_surface.set_size(dimensions.0, dimensions.1);
+
+        surface.commit();
+        (surface, shell_surface)
     }
 
     fn outputs_changed(&mut self) {
@@ -75,47 +122,36 @@ impl AppInner {
             surface.destroy();
         }
 
-        let mut surfaces = Vec::new();
-        let mut shell_surfaces = Vec::new();
         self.configured_surfaces = Arc::new(Mutex::new(0));
-        for output in self.outputs.iter() {
-            let surface = compositor
-                .create_surface(NewProxy::implement_dummy)
-                .unwrap();
 
-            let configured = self.configured_surfaces.clone();
-            let tx = self.draw_tx.clone();
-            let shell_surface = shell
-                .get_layer_surface(
-                    &surface,
-                    Some(&output.1),
-                    zwlr_layer_shell_v1::Layer::Overlay,
-                    "".to_string(),
-                    move |layer| {
-                        layer.implement_closure(
-                            move |evt, layer| match evt {
-                                zwlr_layer_surface_v1::Event::Configure { serial, .. } => {
-                                    *(configured.lock().unwrap()) += 1;
-                                    layer.ack_configure(serial);
-                                    tx.send(false).unwrap();
-                                }
-                                _ => unreachable!(),
-                            },
-                            (),
-                        )
-                    },
-                )
-                .unwrap();
+        if self.visible {
+            match self.output_mode {
+                OutputMode::Active => {
+                    if self.shell_surfaces.len() > 0 {
+                        return;
+                    }
+                    let (surface, shell_surface) = AppInner::add_shell_surface(&compositor, &shell, self.dimensions, self.configured_surfaces.clone(), self.draw_tx.clone(), None);
+                    self.surfaces = vec![surface];
+                    self.shell_surfaces = vec![shell_surface];
 
-            shell_surface.set_keyboard_interactivity(1);
-            shell_surface.set_size(self.dimensions.0, self.dimensions.1);
-            surface.commit();
-            shell_surfaces.push(shell_surface);
-            surfaces.push(surface);
+                },
+                OutputMode::All => {
+                    let mut surfaces = Vec::new();
+                    let mut shell_surfaces = Vec::new();
+                    for output in self.outputs.iter() {
+                        let (surface, shell_surface) = AppInner::add_shell_surface(&compositor, &shell, self.dimensions, self.configured_surfaces.clone(), self.draw_tx.clone(), Some(&output.1));
+                        surfaces.push(surface);
+                        shell_surfaces.push(shell_surface);
+                    }
+                    self.surfaces = surfaces;
+                    self.shell_surfaces = shell_surfaces;
+                }
+            }
+            self.draw_tx.send(Cmd::ForceDraw).unwrap();
+        } else {
+            self.surfaces = Vec::new();
+            self.shell_surfaces = Vec::new();
         }
-        self.surfaces = surfaces;
-        self.shell_surfaces = shell_surfaces;
-        self.draw_tx.send(false).unwrap();
     }
 
     fn add_output(&mut self, id: u32, output: wl_output::WlOutput) {
@@ -221,6 +257,12 @@ impl App {
         Ok(())
     }
 
+    pub fn toggle_visible(&mut self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.visible = !inner.visible;
+        inner.outputs_changed();
+    }
+
     pub fn cmd_queue(&self) -> Arc<Mutex<VecDeque<Cmd>>> {
         self.cmd_queue.clone()
     }
@@ -263,8 +305,8 @@ impl App {
         None
     }
 
-    pub fn new(tx: Sender<bool>) -> App {
-        let inner = Arc::new(Mutex::new(AppInner::new(tx.clone())));
+    pub fn new(tx: Sender<Cmd>, output_mode: OutputMode) -> App {
+        let inner = Arc::new(Mutex::new(AppInner::new(tx.clone(), output_mode)));
 
         //
         // Set up modules
@@ -276,7 +318,7 @@ impl App {
                 Module::new(Box::new(Calendar::new()), (0, 368, 1232, 344)),
             ];
 
-            if let Ok(m) = Launcher::new() {
+            if let Ok(m) = Launcher::new(tx.clone()) {
                 modules.push(Module::new(Box::new(m), (0, 728, 1232, 32)));
             }
 
